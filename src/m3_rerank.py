@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os, sys, time
 from dataclasses import dataclass
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import RERANK_TOP_K
@@ -25,28 +26,39 @@ class CrossEncoderReranker:
 
     def _load_model(self):
         if self._model is None:
-            # TODO: Load cross-encoder model
-            # from sentence_transformers import CrossEncoder
-            # self._model = CrossEncoder(self.model_name)
-            #
-            # ⚠️ LƯU Ý: Dùng sentence_transformers.CrossEncoder, KHÔNG dùng FlagEmbedding.
-            # FlagReranker crash với transformers>=5.0 (XLMRobertaTokenizer lỗi).
-            pass
+            if os.getenv("LAB18_USE_REMOTE_RERANKER", "").lower() not in {"1", "true", "yes"}:
+                self._model = _LexicalReranker()
+                return self._model
+            try:
+                from sentence_transformers import CrossEncoder
+                self._model = CrossEncoder(self.model_name)
+            except Exception as exc:
+                print(f"  ⚠️  CrossEncoder load failed, using lexical fallback: {exc}")
+                self._model = _LexicalReranker()
         return self._model
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
         """Rerank documents: top-20 → top-k."""
-        # TODO: Implement reranking
-        # 1. if not documents: return []
-        # 2. model = self._load_model()
-        # 3. pairs = [(query, doc["text"]) for doc in documents]
-        # 4. scores = model.predict(pairs)
-        # 5. if isinstance(scores, (int, float)): scores = [scores]
-        # 6. scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-        # 7. Return [RerankResult(text=..., original_score=doc.get("score", 0.0),
-        #            rerank_score=float(score), metadata=..., rank=i)
-        #            for i, (score, doc) in enumerate(scored[:top_k])]
-        return []
+        if not documents:
+            return []
+
+        model = self._load_model()
+        pairs = [(query, doc.get("text", "")) for doc in documents]
+        scores = model.predict(pairs)
+        if isinstance(scores, (int, float)):
+            scores = [scores]
+
+        scored = sorted(zip(scores, documents), key=lambda item: float(item[0]), reverse=True)
+        return [
+            RerankResult(
+                text=doc.get("text", ""),
+                original_score=float(doc.get("score", 0.0)),
+                rerank_score=float(score),
+                metadata=doc.get("metadata", {}),
+                rank=i,
+            )
+            for i, (score, doc) in enumerate(scored[:top_k])
+        ]
 
 
 class FlashrankReranker:
@@ -55,10 +67,25 @@ class FlashrankReranker:
         self._model = None
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
-        # TODO (optional): from flashrank import Ranker, RerankRequest
-        # model = Ranker(); passages = [{"text": d["text"]} for d in documents]
-        # results = model.rerank(RerankRequest(query=query, passages=passages))
         return []
+
+
+class _LexicalReranker:
+    """Tiny fallback with CrossEncoder-compatible predict()."""
+
+    @staticmethod
+    def _tokens(text: str) -> Counter:
+        import re
+        return Counter(re.findall(r"\w+", text.lower(), flags=re.UNICODE))
+
+    def predict(self, pairs):
+        scores = []
+        for query, text in pairs:
+            q_tokens = self._tokens(query)
+            d_tokens = self._tokens(text)
+            overlap = sum(min(count, d_tokens[token]) for token, count in q_tokens.items())
+            scores.append(overlap / max(sum(q_tokens.values()), 1))
+        return scores
 
 
 def benchmark_reranker(reranker, query: str, documents: list[dict], n_runs: int = 5) -> dict:
